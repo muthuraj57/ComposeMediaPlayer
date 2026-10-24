@@ -226,16 +226,18 @@ tasks.configureEach {
 
 mavenPublishing {
     coordinates(
-        groupId = "io.github.kdroidfilter",
+        groupId = "io.github.muthuraj57",
         artifactId = "composemediaplayer",
         version = projectVersion,
     )
 
     pom {
-        name.set("Compose Media Player")
-        description.set("A multiplatform video player library for Compose applications.")
+        name.set("Compose Media Player (muthuraj57 fork)")
+        description.set(
+            "Fork of kdroidFilter/ComposeMediaPlayer with audio-only playback on Windows and desktop stability fixes.",
+        )
         inceptionYear.set("2025")
-        url.set("https://github.com/kdroidFilter/Compose-Media-Player")
+        url.set("https://github.com/muthuraj57/ComposeMediaPlayer")
 
         licenses {
             license {
@@ -250,12 +252,17 @@ mavenPublishing {
                 name.set("Elyahou Hadass")
                 email.set("elyahou.hadass@gmail.com")
             }
+            developer {
+                id.set("muthuraj57")
+                name.set("Muthuraj")
+                url.set("https://github.com/muthuraj57")
+            }
         }
 
         scm {
-            connection.set("scm:git:git://github.com/kdroidFilter/Compose-Media-Player.git")
-            developerConnection.set("scm:git:ssh://git@github.com:kdroidFilter/Compose-Media-Player.git")
-            url.set("https://github.com/kdroidFilter/Compose-Media-Player")
+            connection.set("scm:git:git://github.com/muthuraj57/ComposeMediaPlayer.git")
+            developerConnection.set("scm:git:ssh://git@github.com:muthuraj57/ComposeMediaPlayer.git")
+            url.set("https://github.com/muthuraj57/ComposeMediaPlayer")
         }
     }
 
