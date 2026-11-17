@@ -61,6 +61,9 @@ class WindowsVideoPlayerState : VideoPlayerState {
     companion object {
         private val isMfBootstrapped = AtomicBoolean(false)
 
+        /** How long dispose() waits for an open/seek in native code before finishing the teardown in the background. */
+        private const val DISPOSE_LOCK_TIMEOUT_NS = 2_000_000_000L
+
         /** Map to store volume settings for each player instance */
         private val instanceVolumes = ConcurrentHashMap<Long, Float>()
 
@@ -194,7 +197,7 @@ class WindowsVideoPlayerState : VideoPlayerState {
             }
         }
 
-    private var _error: VideoPlayerError? = null
+    private var _error: VideoPlayerError? by mutableStateOf(null)
     override val error get() = _error
 
     override fun clearError() {
@@ -338,6 +341,36 @@ class WindowsVideoPlayerState : VideoPlayerState {
             return // Already disposing
         }
 
+        // An open or seek in progress may be inside native code (OpenMedia, SeekMedia) with this instance; destroying
+        // it underneath crashes the process (EXCEPTION_ACCESS_VIOLATION, #249). Tear down only while holding
+        // mediaOperationMutex. Spin rather than suspend: dispose often runs on the EDT.
+        val deadlineNs = System.nanoTime() + DISPOSE_LOCK_TIMEOUT_NS
+        var locked = mediaOperationMutex.tryLock()
+        while (!locked && System.nanoTime() < deadlineNs) {
+            try {
+                Thread.sleep(5)
+            } catch (_: InterruptedException) {
+                break
+            }
+            locked = mediaOperationMutex.tryLock()
+        }
+        if (locked) {
+            try {
+                releaseNativePlayer()
+            } finally {
+                mediaOperationMutex.unlock()
+            }
+            scope.cancel()
+        } else {
+            // Still blocked in native code (e.g. a slow HTTP connect in OpenMedia): finish once it returns.
+            Thread({
+                kotlinx.coroutines.runBlocking { mediaOperationMutex.withLock { releaseNativePlayer() } }
+                scope.cancel()
+            }, "ComposeMediaPlayer-dispose").start()
+        }
+    }
+
+    private fun releaseNativePlayer() {
         // Stop coroutines first. The producer reads native state under
         // videoReaderMutex; we must wait for it to exit its critical section
         // before tearing down the native reader, otherwise CloseMedia can
@@ -371,7 +404,9 @@ class WindowsVideoPlayerState : VideoPlayerState {
                 // stalls.
                 val deadlineNs = System.nanoTime() + 500_000_000L
                 if (java.awt.EventQueue.isDispatchThread()) {
-                    while (jobToJoin.isActive && System.nanoTime() < deadlineNs) {
+                    // isActive is already false right after cancel(); wait until the job (and the
+                    // producer's native read) has actually finished.
+                    while (!jobToJoin.isCompleted && System.nanoTime() < deadlineNs) {
                         try { Thread.sleep(10) } catch (_: InterruptedException) { break }
                     }
                 } else {
@@ -402,8 +437,6 @@ class WindowsVideoPlayerState : VideoPlayerState {
                 windowsLogger.e { "Exception destroying instance: ${e.message}" }
             }
         }
-
-        scope.cancel()
     }
 
     private fun releaseAllResources() {
@@ -498,6 +531,8 @@ class WindowsVideoPlayerState : VideoPlayerState {
             mediaOperationMutex.withLock {
                 try {
                     isLoading = true
+                    // An error from a previous source must not stick to this one.
+                    clearError()
 
                     // Stop playback and release existing resources
                     val wasPlaying = _isPlaying
@@ -547,16 +582,12 @@ class WindowsVideoPlayerState : VideoPlayerState {
                     // Get the video dimensions
                     val sizeArr = IntArray(2)
                     player.GetVideoSize(instance, sizeArr)
-                    if (sizeArr[0] <= 0 || sizeArr[1] <= 0) {
-                        setError("Failed to retrieve video size")
-                        player.CloseMedia(instance)
-                        return@withLock
-                    }
+                    // 0 x 0 = audio-only media (the native side opened it without a video stream).
                     videoWidth = sizeArr[0]
                     videoHeight = sizeArr[1]
 
                     // Scale output to match display surface (saves memory for 4K+ video)
-                    if (surfaceWidth > 0 && surfaceHeight > 0) {
+                    if (videoWidth > 0 && surfaceWidth > 0 && surfaceHeight > 0) {
                         val hrScale = player.SetOutputSize(instance, surfaceWidth, surfaceHeight)
                         if (hrScale >= 0) {
                             player.GetVideoSize(instance, sizeArr)
@@ -701,7 +732,12 @@ class WindowsVideoPlayerState : VideoPlayerState {
                     }
                     pause()
                     onPlaybackEnded?.invoke()
-                    break
+                    // Stay alive: a seek clears EOF and play() resumes without restarting this job, so the
+                    // next end of media must be detected here too.
+                    while (scope.isActive && _hasMedia && !isDisposing.get() && player.IsEOF(videoPlayerInstance)) {
+                        delay(100)
+                    }
+                    continue
                 }
             }
 
@@ -724,6 +760,12 @@ class WindowsVideoPlayerState : VideoPlayerState {
             // on videoReaderMutex which the seek flow is holding.
             if (isSeeking.get()) {
                 delay(5)
+                continue
+            }
+
+            // Audio-only: no frames to read; the consumer reports the position.
+            if (videoWidth <= 0) {
+                delay(50)
                 continue
             }
 
@@ -872,6 +914,11 @@ class WindowsVideoPlayerState : VideoPlayerState {
             try {
                 val frameData =
                     frameChannel.tryReceive().getOrNull() ?: run {
+                        if (videoWidth <= 0) {
+                            updateAudioOnlyPosition()
+                            delay(100)
+                            return@run null
+                        }
                         if (isLoading && !frameReceived) {
                             loadingTimeout++
                             if (loadingTimeout > 200) {
@@ -1194,6 +1241,19 @@ class WindowsVideoPlayerState : VideoPlayerState {
                 }
             }
         }
+    }
+
+    /** Audio-only media has no frame timestamps: take the position from the native audio clock. */
+    private fun updateAudioOnlyPosition() {
+        val instance = videoPlayerInstance
+        if (instance == 0L || !_hasMedia || isSeeking.get()) return
+        val posArr = LongArray(1)
+        if (player.GetMediaPosition(instance, posArr) < 0) return
+        _currentTime = posArr[0] / 10000000.0
+        if (!_userDragging) {
+            _progress = if (_duration > 0.0) (_currentTime / _duration).toFloat().coerceIn(0f, 1f) else 0f
+        }
+        isLoading = false
     }
 
     /**
